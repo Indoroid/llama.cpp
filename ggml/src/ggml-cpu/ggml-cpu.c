@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "iqp.h"
 #include "ggml-cpu-impl.h"
@@ -1463,6 +1464,14 @@ UseGgmlGemm2:;
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
+static ggml_expert_ready_hook_t ggml_expert_ready_hook;
+static void * ggml_expert_ready_hook_user_data;
+
+void ggml_cpu_set_expert_ready_hook(ggml_expert_ready_hook_t hook, void * user_data) {
+    ggml_expert_ready_hook = hook;
+    ggml_expert_ready_hook_user_data = user_data;
+}
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -1667,6 +1676,10 @@ static void ggml_compute_forward_mul_mat_id(
 
         if (cne1 == 0) {
             continue;
+        }
+
+        if (ggml_expert_ready_hook) {
+            ggml_expert_ready_hook(src0, cur_a, ggml_expert_ready_hook_user_data);
         }
 
         if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
