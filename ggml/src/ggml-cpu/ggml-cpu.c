@@ -1478,6 +1478,14 @@ void ggml_cpu_set_expert_ready_hook(ggml_expert_ready_hook_t hook, void * user_d
     ggml_expert_ready_hook_user_data = user_data;
 }
 
+static ggml_weight_ready_hook_t ggml_weight_ready_hook;
+static void *                   ggml_weight_ready_hook_user_data;
+
+void ggml_cpu_set_weight_ready_hook(ggml_weight_ready_hook_t hook, void * user_data) {
+    ggml_weight_ready_hook           = hook;
+    ggml_weight_ready_hook_user_data = user_data;
+}
+
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
@@ -3143,6 +3151,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT && ggml_weight_ready_hook) {
+            if (state->ith == 0 && !ggml_weight_ready_hook(node->src[0], ggml_weight_ready_hook_user_data)) {
+                atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
+                tp->ec = GGML_STATUS_ABORTED;
+            }
+            // Publish loaded weights and the abort decision before any worker enters a kernel.
+            ggml_barrier(tp);
+            if (atomic_load_explicit(&tp->abort, memory_order_relaxed) == node_n + 1) {
+                break;
+            }
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time

@@ -19,12 +19,15 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <atomic>
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -12211,6 +12214,153 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+// The producer writes native weight bytes only after the compute callback requests them.
+struct weight_ready_test {
+    ggml_tensor *           weights[2];
+    std::vector<uint8_t>    bytes[2];
+    std::mutex              mutex;
+    std::condition_variable cv;
+    int                     requested = -1;
+    int                     loaded    = -1;
+    int                     calls     = 0;
+    int                     fail_at   = -1;
+    bool                    stop      = false;
+    std::atomic<int>        expert_calls{ 0 };
+
+    static bool ready(const ggml_tensor * weight, void * data) {
+        auto &    s     = *static_cast<weight_ready_test *>(data);
+        const int index = s.calls++;
+        if (index >= 2 || weight != s.weights[index] || index == s.fail_at) {
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(s.mutex);
+        s.requested = index;
+        s.cv.notify_all();
+        return s.cv.wait_for(lock, std::chrono::seconds(5), [&] { return s.loaded == index; });
+    }
+
+    static void expert(const ggml_tensor *, int, void * data) {
+        static_cast<weight_ready_test *>(data)->expert_calls.fetch_add(1);
+    }
+
+    void produce() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (cv.wait_for(lock, std::chrono::seconds(5), [&] { return stop || requested != loaded; }) && !stop) {
+            const int index = requested;
+            // The prior matmul must be complete before its weights can be evicted.
+            if (index > 0) {
+                memset(weights[index - 1]->data, 0, bytes[index - 1].size());
+            }
+            memcpy(weights[index]->data, bytes[index].data(), bytes[index].size());
+            loaded = index;
+            cv.notify_all();
+        }
+    }
+};
+
+static int test_weight_ready() {
+    ggml_backend_load_all();
+    ggml_backend_ptr backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    if (!backend) {
+        return 77;
+    }
+    auto * reg       = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+    auto   set_ready = reinterpret_cast<void (*)(ggml_weight_ready_hook_t, void *)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_weight_ready_hook"));
+    auto set_expert = reinterpret_cast<void (*)(ggml_expert_ready_hook_t, void *)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_cpu_set_expert_ready_hook"));
+    auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+    if (!set_ready || !set_expert || !set_threads) {
+        fprintf(stderr, "CPU readiness hook entry points missing\n");
+        return 1;
+    }
+    int cases = 0;
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_K,
+                            GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
+        for (int threads : { 1, 4 }) {
+            for (int tokens : { 1, 4, 32 }) {
+                set_threads(backend.get(), threads);
+                ggml_init_params params = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
+                ggml_context_ptr ctx(ggml_init(params));
+                auto *           storage = ggml_new_tensor_2d(ctx.get(), type, 256, 257);
+                auto *           first   = ggml_view_2d(ctx.get(), storage, 256, 256, storage->nb[1], storage->nb[1]);
+                auto *           second  = ggml_new_tensor_2d(ctx.get(), type, 256, 64);
+                auto *           input   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 256, tokens);
+                auto *           a       = ggml_mul_mat(ctx.get(), first, input);
+                auto *           b       = ggml_mul_mat(ctx.get(), second, a);
+                auto *           experts = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 64, 32, 2);
+                auto *           ids     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, tokens);
+                auto * output = ggml_mul_mat_id(ctx.get(), experts, ggml_reshape_3d(ctx.get(), b, 64, 1, tokens), ids);
+                auto * graph  = ggml_new_graph(ctx.get());
+                ggml_build_forward_expand(graph, output);
+                ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+                GGML_ASSERT(buffer && ggml_backend_buffer_is_host(buffer.get()));
+                for (auto * tensor : { storage, second, input, experts }) {
+                    init_tensor_uniform(tensor);
+                }
+                std::vector<int32_t> routes(tokens);
+                for (int i = 0; i < tokens; ++i) {
+                    routes[i] = i % 2;
+                }
+                ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+                GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+                std::vector<uint8_t> expected(ggml_nbytes(output));
+                ggml_backend_tensor_get(output, expected.data(), 0, expected.size());
+                weight_ready_test s;
+                s.weights[0] = first;
+                s.weights[1] = second;
+                for (int i = 0; i < 2; ++i) {
+                    s.bytes[i].resize(ggml_nbytes(s.weights[i]));
+                    ggml_backend_tensor_get(s.weights[i], s.bytes[i].data(), 0, s.bytes[i].size());
+                }
+                // Repeat success after both failure positions to check abort reset and unregister.
+                for (int failure : { -1, 0, 1, -1 }) {
+                    s.requested = s.loaded = -1;
+                    s.calls                = 0;
+                    s.fail_at              = failure;
+                    s.stop                 = false;
+                    s.expert_calls         = 0;
+                    for (int i = 0; i < 2; ++i) {
+                        memset(s.weights[i]->data, 0, s.bytes[i].size());
+                    }
+                    memset(b->data, 0xa5, ggml_nbytes(b));
+                    memset(output->data, 0xa5, ggml_nbytes(output));
+                    std::thread producer([&] { s.produce(); });
+                    set_ready(weight_ready_test::ready, &s);
+                    set_expert(weight_ready_test::expert, &s);
+                    const auto status = ggml_backend_graph_compute(backend.get(), graph);
+                    set_ready(nullptr, nullptr);
+                    set_expert(nullptr, nullptr);
+                    {
+                        std::lock_guard<std::mutex> lock(s.mutex);
+                        s.stop = true;
+                        s.cv.notify_all();
+                    }
+                    producer.join();
+                    if (failure < 0) {
+                        GGML_ASSERT(status == GGML_STATUS_SUCCESS && s.calls == 2 && s.expert_calls > 0);
+                        GGML_ASSERT(memcmp(output->data, expected.data(), expected.size()) == 0);
+                    } else {
+                        GGML_ASSERT(status == GGML_STATUS_ABORTED && s.calls == failure + 1 && s.expert_calls == 0);
+                        for (size_t i = 0; i < ggml_nbytes(b); ++i) {
+                            GGML_ASSERT(static_cast<uint8_t *>(b->data)[i] == 0xa5);
+                        }
+                    }
+                    cases++;
+                }
+                for (int i = 0; i < 2; ++i) {
+                    memcpy(s.weights[i]->data, s.bytes[i].data(), s.bytes[i].size());
+                }
+                GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+                GGML_ASSERT(memcmp(output->data, expected.data(), expected.size()) == 0);
+            }
+        }
+    }
+    printf("weight readiness: %d cases passed (async loads, view, abort, reuse, expert hook coexistence)\n", cases);
+    return 0;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [options]\n\n", argv[0]);
     printf("Valid modes:\n");
@@ -12227,6 +12377,7 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
+    printf("  --test-weight-ready         run CPU streaming readiness regression checks\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
@@ -12238,6 +12389,9 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--test-weight-ready") == 0) {
+        return test_weight_ready();
+    }
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;

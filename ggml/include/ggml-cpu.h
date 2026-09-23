@@ -134,6 +134,11 @@ extern "C" {
     typedef void (*ggml_expert_ready_hook_t)(const struct ggml_tensor * src0, int expert, void * user_data);
     GGML_BACKEND_API void ggml_cpu_set_expert_ready_hook(ggml_expert_ready_hook_t hook, void * user_data);
 
+    // Call before CPU MUL_MAT reads src0. Return false to abort the graph.
+    // Register only while all CPU graphs are idle. Keep src0 and user_data valid during compute.
+    typedef bool (*ggml_weight_ready_hook_t)(const struct ggml_tensor * src0, void * user_data);
+    GGML_BACKEND_API void ggml_cpu_set_weight_ready_hook(ggml_weight_ready_hook_t hook, void * user_data);
+
     GGML_BACKEND_API bool ggml_backend_is_cpu                (ggml_backend_t backend);
     GGML_BACKEND_API void ggml_backend_cpu_set_n_threads     (ggml_backend_t backend_cpu, int n_threads);
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);

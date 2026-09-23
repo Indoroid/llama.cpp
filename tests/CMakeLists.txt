@@ -279,6 +279,8 @@ endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
+add_test(NAME test-weight-ready COMMAND test-backend-ops --test-weight-ready)
+set_tests_properties(test-weight-ready PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 LABELS "main")
 
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
