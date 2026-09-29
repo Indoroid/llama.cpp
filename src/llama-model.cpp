@@ -346,6 +346,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_SPARK2_5:
             return new llama_model_spark2_5(params);
+        case LLM_ARCH_INKLING:
+            return new llama_model_inkling(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2633,7 +2635,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     ggml_type type_idx = GGML_TYPE_F16;
                     // qwen4exp uses llama_memory_hybrid_idx; glm5next carries its indexer in llama_memory_hybrid
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
+                        // all layers have both an attention KV cache and a recurrent (conv) state
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3028,6 +3031,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_INKLING:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
