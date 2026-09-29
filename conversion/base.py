@@ -556,6 +556,16 @@ class ModelBase:
                 else:
                     raise NotImplementedError(f"Quant format {quant_format!r} for method {quant_method!r} is not yet supported")
             elif quant_method == "modelopt":
+                # Reject stacked NVFP4 experts because this converter does not decode them.
+                stacked_expert_aux = [
+                    n for n in self.model_tensors
+                    if n.endswith((".scale2", ".input_amax", ".original_shape"))
+                ]
+                if stacked_expert_aux:
+                    raise NotImplementedError(
+                        "Stacked ModelOpt NVFP4 experts are unsupported; convert from the BF16 checkpoint instead. "
+                        f"Found {stacked_expert_aux[0]!r}."
+                    )
                 # Mixed-precision ModelOpt models: NVFP4 tensors are handled by
                 # _generate_nvfp4_tensors; FP8 tensors have 1D weight_scale and
                 # are dequantized here. k/v scale tensors are unused.
