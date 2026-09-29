@@ -533,7 +533,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
         ggml_tensor * logits = build_lora_mm(
             layer.ffn_gate_inp, cur, nullptr, GGML_PREC_F32_PEDANTIC); // {n_expert + n_shexp, n_tokens}
-        cb(logits, "inkling_moe_logits", il);
+        cb(logits, "ffn_moe_logits", il);
 
         const size_t lsz = ggml_element_size(logits);
 
@@ -546,7 +546,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         cb(scores, "inkling_moe_scores", il);
 
         ggml_tensor * selected = ggml_argsort_top_k(ctx0, scores, n_expert_used); // I32 {n_expert_used, n_tokens}
-        cb(selected, "inkling_moe_topk", il);
+        cb(selected, "ffn_moe_topk", il);
 
         // weights use the raw top-k logits, not the biased scores
         ggml_tensor * routed3     = ggml_reshape_3d(ctx0, routed, 1, n_expert, n_tokens);
@@ -560,7 +560,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         w = ggml_soft_max(ctx0, w);
         w = ggml_scale(ctx0, w, hparams.expert_weights_scale);
         w = ggml_mul(ctx0, w, layer.ffn_gscale); // gate global_scale (F32 [1])
-        cb(w, "inkling_moe_weights", il);
+        cb(w, "ffn_moe_weights", il);
 
         const size_t wsz = ggml_element_size(w);
 
